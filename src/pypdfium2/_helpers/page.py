@@ -349,7 +349,27 @@ class PdfPage (pdfium_i.AutoCloseable):
     # - add helpers for matrix-based and interruptible rendering
     # - add lower-level renderer that takes a caller-provided bitmap
     # e.g. render(), render_ex(), render_matrix(), render_matrix_ex()
-    
+
+    def _render_bitmap(self, bitmap, pos_args, flags, color_scheme, rev_byteorder, may_draw_forms):
+        # shared render tail of render() / render_to_canvas()
+
+        render_args = (bitmap, self, *pos_args, flags)
+
+        if color_scheme is None:
+            pdfium_c.FPDF_RenderPageBitmap(*render_args)
+        else:
+            pause = pdfium_c.IFSDK_PAUSE(version=1)
+            pdfium_i.set_callback(pause, "NeedToPauseNow", _pause_noop)
+            fpdf_cs = color_scheme.convert(rev_byteorder)
+            status = pdfium_c.FPDF_RenderPageBitmapWithColorScheme_Start(*render_args, fpdf_cs, pause)
+            assert status != pdfium_c.FPDF_RENDER_FAILED, "Progressive render return code indicates failure"
+            pdfium_c.FPDF_RenderPage_Close(self)
+
+        if may_draw_forms and self.formenv:
+            pdfium_c.FPDF_FFLDraw(self.formenv, *render_args)
+
+        bitmap._render_args = (weakref.ref(self), pos_args)
+
     def render(
             self,
             scale = 1,
@@ -474,22 +494,93 @@ class PdfPage (pdfium_i.AutoCloseable):
         bitmap.fill_rect(fill_color, 0, 0, width, height)
         
         pos_args = (-crop[0], -crop[3], src_width, src_height, pdfium_i.RotationToConst[rotation])
-        render_args = (bitmap, self, *pos_args, flags)
-        
-        if color_scheme is None:
-            pdfium_c.FPDF_RenderPageBitmap(*render_args)
-        else:
-            pause = pdfium_c.IFSDK_PAUSE(version=1)
-            pdfium_i.set_callback(pause, "NeedToPauseNow", _pause_noop)
-            fpdf_cs = color_scheme.convert(rev_byteorder)
-            status = pdfium_c.FPDF_RenderPageBitmapWithColorScheme_Start(*render_args, fpdf_cs, pause)
-            assert status != pdfium_c.FPDF_RENDER_FAILED, "Progressive render return code indicates failure"
-            pdfium_c.FPDF_RenderPage_Close(self)
-        
-        if may_draw_forms and self.formenv:
-            pdfium_c.FPDF_FFLDraw(self.formenv, *render_args)
-        
-        bitmap._render_args = (weakref.ref(self), pos_args)
+        self._render_bitmap(bitmap, pos_args, flags, color_scheme, rev_byteorder, may_draw_forms)
+        return bitmap
+
+    def render_to_canvas(
+            self,
+            width,
+            height,
+            rotation = 0,
+            may_draw_forms = True,
+            bitmap_maker = PdfBitmap.new_native,
+            color_scheme = None,
+            fill_to_stroke = False,
+            **kwargs
+        ):
+        """
+        Rasterize the page onto a canvas of exactly *width* × *height* pixels.
+
+        The page is scaled to fit the canvas while preserving aspect ratio ("contain") and centered.
+        Any remaining margins keep the *fill_color* the bitmap was initialized with.
+        Unlike scaling a full-page bitmap to the target size afterwards, this renders at the final
+        resolution in a single pass, so there is no resampling blur, and pixel positions line up
+        exactly with the coordinate translation provided by :meth:`.PdfBitmap.get_posconv`.
+
+        Parameters:
+
+            width (int):
+                Canvas width in pixels.
+
+            height (int):
+                Canvas height in pixels.
+
+            rotation (int):
+                Additional rotation in degrees (0, 90, 180, or 270), applied before fitting.
+
+            may_draw_forms (bool):
+                If True, render form fields (provided the document has forms and :meth:`~.PdfDocument.init_forms` was called).
+
+            bitmap_maker (typing.Callable):
+                Callback function used to create the :class:`.PdfBitmap`.
+
+            color_scheme (PdfColorScheme | None):
+                A custom pdfium color scheme.
+
+            fill_to_stroke (bool):
+                If a *color_scheme* is given, whether to only draw borders around fill areas using the `path_stroke` color, instead of filling with the `path_fill` color.
+
+            kwargs:
+                Further parameters as in :meth:`.render` (e.g. ``fill_color``, ``grayscale``, ``rev_byteorder``, ``prefer_bgrx``, ``maybe_alpha``, ``force_bitmap_format``, ...).
+
+        Returns:
+            PdfBitmap: Bitmap of exactly the requested size, with the page centered in it.
+            Call :meth:`.PdfBitmap.get_posconv` on it to translate between canvas pixel positions
+            and page coordinates (PDF canvas units), using the same parameters as the actual rendering.
+
+        Hint:
+            If the canvas size matches the page's pixel size at scale 1 (accounting for *rotation*),
+            the result is pixel-identical to :meth:`.render` with the same *rotation*.
+        """
+
+        if not (isinstance(width, int) and isinstance(height, int)) or width < 1 or height < 1:
+            raise ValueError(f"Invalid canvas size ({width}, {height})")
+
+        page_w, page_h = self.get_size()
+        if page_w <= 0 or page_h <= 0:
+            raise ValueError(f"Invalid page size ({page_w}, {page_h})")
+        if rotation in (90, 270):
+            page_w, page_h = page_h, page_w
+        scale = min(width/page_w, height/page_h)
+
+        # pixel size of the page area on the canvas, using the same rounding as render()
+        src_width  = math.ceil(self.get_width()  * scale)
+        src_height = math.ceil(self.get_height() * scale)
+        if rotation in (90, 270):
+            src_width, src_height = src_height, src_width
+
+        start_x = (width  - src_width)  // 2
+        start_y = (height - src_height) // 2
+
+        cl_format, rev_byteorder, fill_color, flags = _parse_renderopts(self, **kwargs)
+        if (color_scheme is not None) and fill_to_stroke:
+            flags |= pdfium_c.FPDF_CONVERT_FILL_TO_STROKE
+
+        bitmap = bitmap_maker(width, height, format=cl_format, rev_byteorder=rev_byteorder)
+        bitmap.fill_rect(fill_color, 0, 0, width, height)
+
+        pos_args = (start_x, start_y, src_width, src_height, pdfium_i.RotationToConst[rotation])
+        self._render_bitmap(bitmap, pos_args, flags, color_scheme, rev_byteorder, may_draw_forms)
         return bitmap
 
 

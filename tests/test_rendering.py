@@ -256,6 +256,122 @@ def test_render_new():
     bitmap = page.render()
 
 
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_render_to_canvas_size(sample_page, rotation):
+    for size in [(512, 512), (300, 500), (500, 300), (1, 1)]:
+        bitmap = sample_page.render_to_canvas(*size, rotation=rotation)
+        assert (bitmap.width, bitmap.height) == size
+        assert bitmap.to_pil().size == size
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_render_to_canvas_identity(sample_page, rotation):
+    # canvas at the page's native pixel size with matching rotation must be
+    # pixel-identical to a plain render() call
+    ref_bitmap = sample_page.render(scale=1, rotation=rotation)
+    canvas_bitmap = sample_page.render_to_canvas(
+        ref_bitmap.width, ref_bitmap.height,
+        rotation = rotation,
+    )
+    assert (canvas_bitmap.width, canvas_bitmap.height) == (ref_bitmap.width, ref_bitmap.height)
+    assert canvas_bitmap.mode == ref_bitmap.mode
+    assert bytes(canvas_bitmap.buffer) == bytes(ref_bitmap.buffer)
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_render_to_canvas_margins(sample_page, rotation):
+    fill_color = (230, 230, 230, 255)
+    bitmap = sample_page.render_to_canvas(512, 512, rotation=rotation, fill_color=fill_color)
+    pil_image = bitmap.to_pil()
+    # with contain-fitting, the canvas corners always fall into the margins
+    for pos in [(0, 0), (511, 0), (0, 511), (511, 511)]:
+        assert pil_image.getpixel(pos) == fill_color[:-1]
+    # known page content must appear at the translated canvas position
+    # (ExpRenderPixels are bitmap positions at scale 1, rotation 0)
+    posconv = bitmap.get_posconv(sample_page)
+    page_h = sample_page.get_height()
+    for (x, y), value in ExpRenderPixels[1:]:
+        canvas_pos = posconv.to_bitmap(x, page_h - y)
+        assert pil_image.getpixel(canvas_pos) == value
+
+
+def test_render_to_canvas_fill_alpha(sample_page):
+    fill_color = (60, 70, 80, 100)
+    bitmap = sample_page.render_to_canvas(700, 900, fill_color=fill_color)
+    assert bitmap.mode == "BGRA"
+    pil_image = bitmap.to_pil()
+    assert pil_image.mode == "RGBA"
+    assert pil_image.getpixel( (0, 0) ) == fill_color
+
+
+def test_render_to_canvas_rev_byteorder(sample_page):
+    fill_color = (60, 70, 80, 255)
+    bitmap = sample_page.render_to_canvas(700, 900, fill_color=fill_color)
+    bitmap_rev = sample_page.render_to_canvas(700, 900, fill_color=fill_color, rev_byteorder=True)
+    assert bitmap.mode == "BGR"
+    assert bitmap_rev.mode == "RGB"
+    assert bitmap.to_pil().getpixel( (0, 0) ) == fill_color[:-1]
+    assert bitmap.to_pil() == bitmap_rev.to_pil()
+
+
+def test_render_to_canvas_invalid(sample_page):
+    for size in [(0, 100), (100, 0), (-1, 100), (100, -1)]:
+        with pytest.raises(ValueError, match="Invalid canvas size"):
+            sample_page.render_to_canvas(*size)
+
+
+SynthRects = [
+    # (x, y, w, h) in PDF canvas units (origin bottom left), RGB color
+    ( (20,  60, 40, 30), (255, 0,   0  ) ),
+    ( (120, 10, 50, 40), (0,   0,   255) ),
+]
+
+@pytest.fixture
+def synth_page():
+    pdf = pdfium.PdfDocument.new()
+    page = pdf.new_page(200, 100)
+    for (x, y, w, h), (r, g, b) in SynthRects:
+        raw_rect = pdfium_c.FPDFPageObj_CreateNewRect(x, y, w, h)
+        assert raw_rect
+        ok = pdfium_c.FPDFPageObj_SetFillColor(raw_rect, r, g, b, 255)
+        assert ok
+        ok = pdfium_c.FPDFPath_SetDrawMode(raw_rect, pdfium_c.FPDF_FILLMODE_WINDING, False)
+        assert ok
+        page.insert_obj( pdfium.PdfObject(raw_rect, pdf=pdf) )
+    page.gen_content()
+    yield page
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_render_to_canvas_posconv(synth_page, rotation):
+
+    W, H = synth_page.get_size()
+    CW, CH = 512, 512
+    bitmap = synth_page.render_to_canvas(CW, CH, rotation=rotation)
+    assert (bitmap.width, bitmap.height) == (CW, CH)
+    posconv = bitmap.get_posconv(synth_page)
+    pil_image = bitmap.to_pil()
+
+    # scale of the contain-fitting, for pixel<->canvas-unit conversions
+    eff_w, eff_h = (H, W) if rotation in (90, 270) else (W, H)
+    scale = min(CW/eff_w, CH/eff_h)
+
+    for (x, y, w, h), color in SynthRects:
+        page_center = (x + w/2, y + h/2)
+        # the rect's color block must appear at the translated canvas position
+        canvas_pos = posconv.to_bitmap(*page_center)
+        assert pil_image.getpixel(canvas_pos) == color
+        # round trip back to page coordinates, with at most 1px error
+        rt_page = posconv.to_page(*canvas_pos)
+        for rt_coord, exp_coord in zip(rt_page, page_center):
+            assert abs(rt_coord - exp_coord) * scale == pytest.approx(0, abs=1)
+
+    # canvas corners fall into the margins, i.e. outside the page
+    corner_page = posconv.to_page(0, 0)
+    assert not (0 <= corner_page[0] <= W and 0 <= corner_page[1] <= H)
+
+
+
 def test_render_with_stream_read():
     stream = open(TestFiles.multipage, "rb")
     pdf = pdfium.PdfDocument(stream)
