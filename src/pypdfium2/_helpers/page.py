@@ -70,6 +70,23 @@ class PdfPage (pdfium_i.AutoCloseable):
             (float, float): Page width and height, in PDF canvas units.
         """
         return (self.get_width(), self.get_height())
+
+    def get_display_size(self, scale=1):
+        """
+        .. versionadded:: 5.16.0
+
+        Parameters:
+            scale (float): Factor to multiply the display size with (e.g. a rendering scale).
+        Returns:
+            (float, float): Page width and height in display coordinates (top-left origin, y-axis pointing down),
+            accounting for page rotation and CropBox, multiplied by *scale*.
+            This is the coordinate space used by :meth:`.PdfTextPage.get_rects` and :meth:`.PdfTextPage.hit_test`.
+        """
+        l, b, r, t = self.get_bbox()
+        width, height = r-l, t-b
+        if self.get_rotation() in (90, 270):
+            width, height = height, width
+        return (width*scale, height*scale)
     
     
     # {get,set}_rotation() deliberately fail with dict access error in case of invalid values

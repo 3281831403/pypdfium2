@@ -69,6 +69,93 @@ def test_getrectboxes(textpage):
     assert textpage.get_text_range(textpage.count_chars()-len(text))  # count=-1
 
 
+def test_get_rects(textpage):
+
+    rects = textpage.get_rects()
+    assert len(rects) == 10
+
+    # display coordinates: top-left origin, y down (page height ca. 841.89)
+    first_rect = rects[0]
+    assert first_rect == pytest.approx((58.18, 59.68, 258.48, 75.05), abs=0.1)
+    for rect in rects:
+        assert len(rect) == 4
+        assert rect[0] < rect[2] and rect[1] < rect[3]
+
+    # the range starting at char 29 with 27 chars covers exactly the second line
+    line2_rects = textpage.get_rects(29, 27)
+    assert len(line2_rects) == 1
+    assert line2_rects[0] == pytest.approx((57.62, 114.88, 235.18, 130.24), abs=0.1)
+    assert line2_rects[0] == rects[1]
+
+    # scaled coordinates
+    scaled_rects = textpage.get_rects(scale=2)
+    assert len(scaled_rects) == 10
+    for scaled, rect in zip(scaled_rects, rects):
+        assert scaled == pytest.approx([v*2 for v in rect])
+
+    # empty or out-of-bounds ranges yield an empty list
+    assert textpage.get_rects(0, 0) == []
+    assert textpage.get_rects(1000) == []
+    assert textpage.get_rects(-1, 5) == []
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+@pytest.mark.parametrize("cropbox", [None, (50, 60, 500, 700)])
+def test_get_rects_display_coords(rotation, cropbox):
+
+    pdf = pdfium.PdfDocument(TestFiles.text)
+    page = pdf[0]
+    if cropbox:
+        page.set_cropbox(*cropbox)
+    page.set_rotation(rotation)
+    textpage = page.get_textpage()
+
+    scale = 2
+    n_rects = textpage.count_rects()
+    native_rects = [textpage.get_rect(i) for i in range(n_rects)]
+
+    # reference: transform the native rects with pdfium's own render position converter
+    bitmap = page.render(scale=scale)
+    posconv = bitmap.get_posconv(page)
+    exp_rects = []
+    for l, b, r, t in native_rects:
+        corners = [posconv.to_bitmap(x, y) for x, y in ((l, b), (r, b), (l, t), (r, t))]
+        xs, ys = [c[0] for c in corners], [c[1] for c in corners]
+        exp_rects.append( (min(xs), min(ys), max(xs), max(ys)) )
+
+    rects = textpage.get_rects(scale=scale)
+    assert len(rects) == len(exp_rects) == 10
+    for rect, exp in zip(rects, exp_rects):
+        assert rect == pytest.approx(exp, abs=1)
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+@pytest.mark.parametrize("cropbox", [None, (50, 60, 500, 700)])
+def test_hit_test(rotation, cropbox):
+
+    pdf = pdfium.PdfDocument(TestFiles.text)
+    page = pdf[0]
+    if cropbox:
+        page.set_cropbox(*cropbox)
+    page.set_rotation(rotation)
+    textpage = page.get_textpage()
+
+    rects = textpage.get_rects()
+    assert len(rects) == 10
+
+    prev_idx = -1
+    for l, t, r, b in rects:
+        idx = textpage.hit_test((l+r)/2, (t+b)/2)
+        assert idx is not None
+        assert prev_idx < idx < textpage.count_chars()
+        # scale invariance (tolerances are in display units, so they scale along)
+        assert textpage.hit_test((l+r)/2*2, (t+b)/2*2, scale=2, x_tol=6, y_tol=6) == idx
+        prev_idx = idx
+
+    # no text at this position
+    assert textpage.hit_test(-1000, -1000) is None
+
+
 def _get_rects(textpage, search_result):
     # TODO add helper?
     if search_result is None:
@@ -130,7 +217,9 @@ def test_textpage_empty():
     assert textpage.get_text_range() == ""
     assert textpage.count_chars() == 0
     assert textpage.count_rects() == 0
+    assert textpage.get_rects() == []
     assert textpage.get_index(0, 0, 0, 0) is None
+    assert textpage.hit_test(0, 0) is None
 
     searcher = textpage.search("a")
     assert searcher.get_next() is None

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 geisserml <geisserml@gmail.com>
 # SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
+import math
 import pytest
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
@@ -43,6 +44,38 @@ def test_rotation():
     for r in (90, 180, 270, 0):
         page.set_rotation(r)
         assert page.get_rotation() == r
+
+
+@pytest.mark.parametrize(
+    "rotation,cropbox,exp_size",
+    [
+        (0,   None,             (595.30, 841.89)),
+        (90,  None,             (841.89, 595.30)),
+        (180, None,             (595.30, 841.89)),
+        (270, None,             (841.89, 595.30)),
+        (0,   (50, 60, 500, 700), (450, 640)),
+        (90,  (50, 60, 500, 700), (640, 450)),
+        (180, (50, 60, 500, 700), (450, 640)),
+        (270, (50, 60, 500, 700), (640, 450)),
+    ]
+)
+def test_get_display_size(rotation, cropbox, exp_size):
+    pdf = pdfium.PdfDocument(TestFiles.text)
+    page = pdf[0]
+    if cropbox:
+        page.set_cropbox(*cropbox)
+    page.set_rotation(rotation)
+
+    w, h = page.get_display_size()
+    assert (w, h) == pytest.approx(exp_size, abs=0.01)
+
+    scale = 2
+    ws, hs = page.get_display_size(scale=scale)
+    assert (ws, hs) == pytest.approx((exp_size[0]*scale, exp_size[1]*scale), abs=0.01)
+
+    # consistency with the bitmap produced by render()
+    bitmap = page.render(scale=scale)
+    assert (bitmap.width, bitmap.height) == (math.ceil(ws), math.ceil(hs))
 
 
 def test_page_labels():

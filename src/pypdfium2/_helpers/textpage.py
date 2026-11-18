@@ -16,6 +16,36 @@ c_double = ctypes.c_double
 logger = logging.getLogger(__name__)
 
 
+def _page_to_display(x, y, bbox, rotation):
+    # Convert native PDF canvas coordinates (bottom-left origin, y up) to display
+    # coordinates (top-left origin, y down), accounting for page rotation and CropBox.
+    # This mirrors the transformation applied by pdfium on rendering (cf. FPDF_PageToDevice).
+    l0, b0, r0, t0 = bbox
+    if rotation == 0:
+        return (x - l0, t0 - y)
+    elif rotation == 90:
+        return (y - b0, x - l0)
+    elif rotation == 180:
+        return (r0 - x, y - b0)
+    elif rotation == 270:
+        return (t0 - y, r0 - x)
+    raise ValueError(f"Invalid rotation {rotation}")
+
+
+def _display_to_page(dx, dy, bbox, rotation):
+    # Inverse of _page_to_display().
+    l0, b0, r0, t0 = bbox
+    if rotation == 0:
+        return (dx + l0, t0 - dy)
+    elif rotation == 90:
+        return (dy + l0, dx + b0)
+    elif rotation == 180:
+        return (r0 - dx, dy + b0)
+    elif rotation == 270:
+        return (r0 - dy, t0 - dx)
+    raise ValueError(f"Invalid rotation {rotation}")
+
+
 class PdfTextPage (pdfium_i.AutoCloseable):
     """
     Text page helper class.
@@ -236,6 +266,81 @@ class PdfTextPage (pdfium_i.AutoCloseable):
         if not ok:
             raise PdfiumError("Failed to get rectangle. (Make sure count_rects() was called with default params once before subsequent get_rect() calls.)")
         return (l.value, b.value, r.value, t.value)
+    
+    
+    def get_rects(self, index=0, count=-1, scale=1):
+        """
+        .. versionadded:: 5.16.0
+    
+        Get the bounding boxes of the text rectangles intersecting a character range,
+        in display coordinates (top-left origin, y-axis pointing down, page rotation and CropBox applied),
+        multiplied by *scale*. This is the coordinate space of a bitmap rendered with the same *scale*,
+        so the returned rectangles may be used directly to draw highlights or selection boxes.
+    
+        The rectangles are merged line by line in character index order (as provided by pdfium);
+        whitespace such as spaces or CRLF does not produce rectangles of its own.
+    
+        Parameters:
+            index (int): Start character index.
+            count (int): Character count to consider (defaults to -1 for all remaining).
+            scale (float): Factor to multiply the display coordinates with.
+        Returns:
+            list[tuple[float, float, float, float]]: A list of (left, top, right, bottom) rectangles
+            in display coordinates. An empty list if the range is empty or out of bounds.
+        """
+    
+        n_chars = self.count_chars()
+        if count == -1:
+            count = n_chars - index
+        if count <= 0 or not 0 <= index < n_chars:
+            return []
+        count = min(count, n_chars - index)
+    
+        # Map the character range to rectangle indices: the rect containing the char at
+        # *index* is the last one intersecting [0, index], and the r_count rects from
+        # there on are the ones intersecting [index, index+count).
+        r_start = self.count_rects(0, index+1) - 1
+        r_count = self.count_rects(index, count)
+        self.count_rects()  # re-init with default params, as required by get_rect()
+        if r_count <= 0:
+            return []
+    
+        bbox = self.page.get_bbox()
+        rotation = self.page.get_rotation()
+        rects = []
+        for i in range(r_start, r_start+r_count):
+            l, b, r, t = self.get_rect(i)
+            corners = [_page_to_display(x, y, bbox, rotation) for x, y in ((l, b), (r, b), (l, t), (r, t))]
+            xs, ys = [c[0] for c in corners], [c[1] for c in corners]
+            rects.append( (min(xs)*scale, min(ys)*scale, max(xs)*scale, max(ys)*scale) )
+        return rects
+    
+    
+    def hit_test(self, x, y, scale=1, x_tol=3, y_tol=3):
+        """
+        .. versionadded:: 5.16.0
+    
+        Get the index of the character at a position given in display coordinates
+        (top-left origin, y-axis pointing down, page rotation and CropBox applied),
+        multiplied by *scale*. This is the inverse direction of :meth:`.get_rects`,
+        e.g. to locate the character under a mouse click.
+    
+        Parameters:
+            x (float): Horizontal position, in display coordinates.
+            y (float): Vertical position, in display coordinates.
+            scale (float): Factor the display coordinates are scaled with.
+            x_tol (float): Horizontal tolerance, in display coordinates.
+            y_tol (float): Vertical tolerance, in display coordinates.
+        Returns:
+            int | None: The index of the character at or nearby the position,
+            or None if there is no character.
+        """
+        bbox = self.page.get_bbox()
+        rotation = self.page.get_rotation()
+        page_x, page_y = _display_to_page(x/scale, y/scale, bbox, rotation)
+        if rotation in (90, 270):
+            x_tol, y_tol = y_tol, x_tol
+        return self.get_index(page_x, page_y, x_tol/scale, y_tol/scale)
     
     
     def get_textobj(self, index):
